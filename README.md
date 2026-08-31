@@ -33,7 +33,8 @@ refuses any subagent type outside the six.
 | `bin/log_outcome.py` `metrics.py` `evaluate.py` `review_outcomes.py` | the offline learning loop |
 | `bin/checkpoint.sh` `debt.sh` | git checkpoint before risky work; harvest deferred shortcuts |
 | `hooks/` | the guards — frozen tests (Edit *and* Bash paths), dangerous commands, protected files, secret scan, orchestrator-only git, delegation contract |
-| `ORCHESTRATOR.md` | the doctrine: classification, routing, the delegation contract, the freeze, bounded repair, acceptance |
+| `CLAUDE.template.md` | **the doctrine** — classification, routing, the delegation contract, the freeze, bounded repair, acceptance. Import this into a project's `CLAUDE.md` |
+| `ORCHESTRATOR.md` | the same system for hosts with no hooks (API use, other clients): the lifecycle in full plus worked examples. Run one or the other, never both |
 | `POLICY.template.md` | the one file you fill in per project |
 
 ## Install
@@ -48,8 +49,8 @@ Nothing lands in the project, and `git pull` updates every project at once.
 ```
 
 Then, in the project you want it to govern, create `POLICY.md` from `POLICY.template.md` and set
-`test_command`. Run `/delegation-doctrine` to load the operating manual, or add it to the
-project's `CLAUDE.md` so it loads every session.
+`test_command`. Run `/delegation-doctrine` to load the doctrine, or paste `CLAUDE.template.md`
+into the project's own `CLAUDE.md` so it loads every session.
 
 ### B. As project files
 
@@ -67,8 +68,12 @@ idempotent — run it again to update.
 Then add one line to the project's `CLAUDE.md`:
 
 ```
-@.claude/ORCHESTRATOR.md
+@.claude/DOCTRINE.md
 ```
+
+(`install.sh` puts the doctrine at `.claude/DOCTRINE.md` and the hookless build at
+`.claude/ORCHESTRATOR.md`. Your project's own `CLAUDE.md` is never touched — the doctrine is
+imported into it, so project facts and system doctrine stay separable.)
 
 and export `DELEGATION="$PWD/.claude/bin"` so the doctrine's commands resolve.
 

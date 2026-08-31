@@ -43,6 +43,7 @@ place "$PKG/bin"    "$C/bin"
 cp "$PKG"/hooks/*.py "$PKG"/hooks/*.sh "$C/hooks/"
 chmod +x "$C"/hooks/* "$C"/bin/* 2>/dev/null || true
 
+cp "$PKG/CLAUDE.template.md" "$C/DOCTRINE.md"
 cp "$PKG/ORCHESTRATOR.md" "$C/ORCHESTRATOR.md"
 
 # --- settings.json: merge hooks in, never clobber what is already there ---
@@ -112,7 +113,7 @@ installed into $TARGET
 
 One line left, in the project's CLAUDE.md:
 
-  @.claude/ORCHESTRATOR.md
+  @.claude/DOCTRINE.md
 
 Then set DELEGATION so the doctrine's commands resolve:
 
