@@ -1,0 +1,7 @@
+{
+  "name": "delegation",
+  "description": "A six-role agent organization with enforced tool boundaries, a skill router, frozen-test verification, and guard hooks. Roles are separated by what they are ALLOWED to do, not by what they are asked to do.",
+  "version": "1.0.0",
+  "author": { "name": "Christian" },
+  "keywords": ["agents", "delegation", "orchestration", "verification", "code-review"]
+}

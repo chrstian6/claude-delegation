@@ -1,0 +1,11 @@
+{
+  "name": "delegation-marketplace",
+  "owner": { "name": "Christian" },
+  "plugins": [
+    {
+      "source": "./",
+      "name": "delegation",
+      "description": "Six-role agent organization: architect, builder, tester, reviewer, repairer, researcher — with guard hooks and a skill router."
+    }
+  ]
+}
