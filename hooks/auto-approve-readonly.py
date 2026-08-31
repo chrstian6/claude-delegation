@@ -69,9 +69,9 @@ PY_UNSAFE = re.compile(
 PY_WRITE_OPEN = re.compile(r"open\s*\([^)]*,[^)]*['\"][wax+]")
 
 # Build/verify commands the swarm runs constantly. Allowlisted by exact script
-# name after auditing both repos' package.json — NOT a blanket `npm run *`,
-# which would sweep in myjeweler-ai's db:migrate, db:import, db:backfill-*,
-# and seed (all of which mutate the database via tsx).
+# name after auditing the project's package.json — NOT a blanket `npm run *`,
+# which sweeps in whatever the project happens to define: db:migrate, db:import,
+# backfills and seeds all mutate a real database. Audit yours before widening.
 NPM_SAFE_SCRIPTS = {
     "lint", "typecheck", "test", "build", "test:e2e", "test:unit",
     "format:check", "lint:fix",
