@@ -23,6 +23,15 @@ INPUT=$(cat)
 COMMAND=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null || true)
 [ -z "$COMMAND" ] && exit 0
 
+# JOIN BACKSLASH LINE-CONTINUATIONS BEFORE ANY MATCHING. `git push \<newline>
+# --force origin main` is one logical command written across two physical lines,
+# and the shell will run it as one. Every pattern below is written against the
+# logical command, so matching them against the raw physical lines lets an
+# ordinary line-wrapped invocation slip past — force-push to anything, with no
+# rule able to see it. Joining here fixes it once, for every rule, instead of
+# teaching 26 patterns about continuations.
+COMMAND=${COMMAND//\\$'\n'/ }
+
 # ── Protected branch list ────────────────────────────────────────────────
 DEFAULT_BRANCHES="main,master"
 if GIT_DEFAULT=$(git config --get init.defaultBranch 2>/dev/null) && [ -n "$GIT_DEFAULT" ]; then
@@ -61,14 +70,33 @@ BR_REGEX=$(printf '%s' "$PROTECTED_BRANCHES" | tr ',' '\n' | awk 'NF{printf "%s%
 # force-pushing to main was auto-approved with no prompt shown. Only the push
 # family diverged (4 of 80 probed variants) because `\n` falls inside
 # [[:space:]] for every other rule — which is exactly what made it invisible.
+#
+# WHOLE-STRING FIRST, THEN PER LINE. The whole-string pass is not redundant: a
+# backslash line-continuation splits one logical command across two physical
+# lines, so `git push \<newline>  --force origin main` is invisible to every
+# per-line pattern while the whole-string pass still sees it. Per-line alone
+# would have been a straight downgrade from the discarded version on exactly
+# that shape.
 _match_lines() {                  # _match_lines <ere>; reads $COMMAND
   local line
+  [[ $COMMAND =~ $1 ]] && return 0
   while IFS= read -r line; do
     [[ $line =~ $1 ]] && return 0
   done <<< "$COMMAND"
   return 1
 }
 contains_cmd() { _match_lines "$1"; }
+# A deny pattern with a suppressor must see BOTH on the same line. Riding two
+# separate whole-input calls let a suppressor on one line disarm a deny on
+# another: `npm publish --dry-run` followed by a real `npm publish` was allowed,
+# which is the precise thing that rule exists to stop.
+contains_cmd_unless() {           # contains_cmd_unless <ere> <suppressor-ere>
+  local line
+  while IFS= read -r line; do
+    [[ $line =~ $1 ]] && ! [[ $line =~ $2 ]] && return 0
+  done <<< "$COMMAND"
+  return 1
+}
 # nocasematch is bash's equivalent of grep -i. Saved and restored rather than
 # left on: it is a shell-wide option and would change the behaviour of every
 # later [[ ]] and case statement in this script.
@@ -82,7 +110,11 @@ contains_icmd() {
 }
 
 # ── Git push protections ────────────────────────────────────────────────
-if contains_cmd '(^|[;&|()]+[[:space:]]*)git[[:space:]]+push'; then
+# `^[[:space:]]*` — WITHOUT it a single leading space or tab disables every push
+# rule below, because they all live inside this gate and the alternation had no
+# whitespace-after-^ branch. An indented `git push --force origin main`, which is
+# what any command inside an `if`/`for`/heredoc looks like, sailed through.
+if contains_cmd '(^[[:space:]]*|[;&|()]+[[:space:]]*)git[[:space:]]+push'; then
   # Explicit refspec to a protected branch (origin main, :main, HEAD:main, remote branch)
   if contains_cmd "git[[:space:]]+push[[:space:]]+[^[:space:]]+[[:space:]]+([^[:space:]]*:)?($BR_REGEX)(\$|[[:space:]])"; then
     MATCHED_BRANCH=$(printf '%s' "$COMMAND" | grep -oE "($BR_REGEX)(\$|[[:space:]])" | head -1 | tr -d '[:space:]')
@@ -100,8 +132,10 @@ if contains_cmd '(^|[;&|()]+[[:space:]]*)git[[:space:]]+push'; then
     fi
   fi
   # Force push (but allow --force-with-lease)
-  if contains_cmd 'git[[:space:]]+push([[:space:]]+[^[:space:]]+)*[[:space:]]+(-[a-zA-Z]*f[a-zA-Z]*|--force)([[:space:]=]|$)' \
-     && ! contains_cmd '\-\-force-with-lease'; then
+  # Same-line suppressor: a --force-with-lease on ANOTHER line must not disarm a
+  # real --force on this one.
+  if contains_cmd_unless 'git[[:space:]]+push([[:space:]]+[^[:space:]]+)*[[:space:]]+(-[a-zA-Z]*f[a-zA-Z]*|--force)([[:space:]=]|$)' \
+     '\-\-force-with-lease'; then
     emit_deny "Blocked: force push is not allowed. Use --force-with-lease if you must overwrite remote."
   fi
 fi
@@ -191,7 +225,7 @@ publish_patterns=(
   'twine[[:space:]]+upload'
 )
 for pat in "${publish_patterns[@]}"; do
-  if contains_cmd "$pat" && ! contains_cmd '(^|[[:space:]])(--dry-run|-n)([[:space:]=]|$)'; then
+  if contains_cmd_unless "$pat" '(^|[[:space:]])(--dry-run|-n)([[:space:]=]|$)'; then
     emit_deny "Blocked: publishing packages should run in CI or manually, not via Claude."
   fi
 done

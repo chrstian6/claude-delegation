@@ -313,7 +313,20 @@ def rule_blocks(rule, tool, tool_input):
             return True                       # can't see the target: fail closed
         return any(glob_matches(spec, v) for v in values)
 
-    if tool == "Agent":
+    if tool in ("Agent", "Task"):
+        # BOTH names, not just Agent. GUARDS wires guard-delegation.py for Agent
+        # AND Task, and hooks.json matches them together as "Task|Agent" — the
+        # two are meant to be the same tool. This branch was gated on Agent
+        # alone, so a Task dispatch with a missing or null subagent_type never
+        # reached the fail-closed return below and was AUTO-APPROVED, while the
+        # identical Agent payload deferred. guard-delegation.py does not cover
+        # it either: it inspects subagent_type only when it is a non-empty
+        # string, so a missing one passes every check it makes.
+        #
+        # Reproduced before the fix:
+        #   Agent, no subagent_type -> defer
+        #   Task,  no subagent_type -> ALLOW
+        #
         # An `Agent(<name>)` deny rule names a subagent type, not a path or a
         # command, so it needs its own comparison. The role allowlist hook was
         # retired on 2026-08-30 with the named-agent org — under Agent OS the

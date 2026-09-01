@@ -21,7 +21,12 @@ TARGET="$(cd "$TARGET" && pwd)"
 [[ "$TARGET" != "$PKG" ]] || { echo "refusing to install the package into itself" >&2; exit 1; }
 
 C="$TARGET/.claude"
-mkdir -p "$C"/{agents,hooks,skills,state}
+# NOT skills/ or bin/ — those are place()'s targets, and in --link mode
+# `ln -sfn src dst` against an EXISTING real directory creates the link INSIDE
+# it (dst/skills -> src) instead of as it. bin/ was never pre-created and so
+# always worked; skills/ was, so a --link install silently resolved ZERO skills
+# and bin/skills.py reported none, with no error anywhere.
+mkdir -p "$C"/{agents,hooks,state}
 
 # place <src-dir> <dst-dir>
 #
@@ -60,8 +65,20 @@ place "$PKG/bin"    "$C/bin"
 cp "$PKG"/hooks/*.py "$PKG"/hooks/*.sh "$C/hooks/"
 chmod +x "$C"/hooks/* "$C"/bin/* 2>/dev/null || true
 
-cp "$PKG/CLAUDE.template.md" "$C/DOCTRINE.md"
-cp "$PKG/ORCHESTRATOR.md" "$C/ORCHESTRATOR.md"
+# Same rule as POLICY.md below: never clobber a file the project may have edited.
+# DOCTRINE.md is what the README tells a project to @-include into its own
+# CLAUDE.md, so it is exactly the kind of file someone tunes — and re-running an
+# "idempotent" installer silently reverting those edits is the same class of bug
+# as the destructive place() this script used to have.
+for doc in "CLAUDE.template.md:DOCTRINE.md" "ORCHESTRATOR.md:ORCHESTRATOR.md"; do
+  src="${doc%%:*}"; dst="${doc##*:}"
+  if [[ -f "$C/$dst" ]] && ! cmp -s "$PKG/$src" "$C/$dst"; then
+    cp "$PKG/$src" "$C/$dst.new"
+    echo "$dst: yours differs — package copy written to $dst.new, yours left alone"
+  else
+    cp "$PKG/$src" "$C/$dst"
+  fi
+done
 
 # --- settings.json: merge hooks in, never clobber what is already there ---
 python3 - "$C" <<'PY'
