@@ -23,14 +23,31 @@ INPUT=$(cat)
 COMMAND=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null || true)
 [ -z "$COMMAND" ] && exit 0
 
-# JOIN BACKSLASH LINE-CONTINUATIONS BEFORE ANY MATCHING. `git push \<newline>
-# --force origin main` is one logical command written across two physical lines,
-# and the shell will run it as one. Every pattern below is written against the
-# logical command, so matching them against the raw physical lines lets an
-# ordinary line-wrapped invocation slip past — force-push to anything, with no
-# rule able to see it. Joining here fixes it once, for every rule, instead of
-# teaching 26 patterns about continuations.
-COMMAND=${COMMAND//\\$'\n'/ }
+# NORMALISE CONTINUATIONS BEFORE ANY MATCHING. `git push \<newline> --force
+# origin main` is one logical command written across two physical lines, and the
+# shell runs it as one. Matching the raw physical lines lets an ordinary
+# line-wrapped invocation slip past every rule.
+#
+# DROP THE BACKSLASH, KEEP THE NEWLINE. Joining to a SPACE instead was a net
+# REGRESSION and was caught in review after being shipped: it splices the two
+# lines into one, and every push rule is anchored `(^[[:space:]]*|[;&|()]+...)`,
+# so anything spliced in front of `git push` closes the gate that was open
+# before. Measured, joining-to-space vs the version before it:
+#
+#   time \<newline>git push --force origin old      DENY -> allow
+#   sudo \<newline>git push --force origin main     DENY -> allow
+#   FOO=bar \<newline>git push --force origin old   DENY -> allow
+#   echo a\\<newline>git push --force origin old    DENY -> allow
+#
+# Four shapes lost to buy one. The last is the sharpest: `\\` is an ESCAPED
+# BACKSLASH, not a continuation — the shell runs two separate commands, and
+# joining them hid a real force push behind `echo a\ `. Joining to a newline
+# cannot splice two commands onto one line, so no anchored pattern is defeated.
+#
+# CR first, or `\`+CRLF is not recognised as a continuation at all and the
+# command stays split.
+COMMAND=${COMMAND//$'\r'/}
+COMMAND=${COMMAND//\\$'\n'/$'\n'}
 
 # ── Protected branch list ────────────────────────────────────────────────
 DEFAULT_BRANCHES="main,master"
@@ -111,6 +128,14 @@ contains_cmd() { _match_lines "$1"; }
 # which is the precise thing that rule exists to stop.
 contains_cmd_unless() {           # contains_cmd_unless <ere> <suppressor-ere>
   local line
+  # Whole-string pass first, same as contains_cmd. Without it this helper is the
+  # ONLY matcher with no cross-line fallback — and it is the one the force-push
+  # rule uses, so any shape the per-line loop cannot see (a continuation the
+  # normaliser above missed) has no second chance. The suppressor is checked at
+  # the same scope, so a legitimate whole-command `--force-with-lease` still
+  # suppresses; a lease on a DIFFERENT line does not, because the per-line loop
+  # below is what decides that case.
+  [[ $COMMAND =~ $1 ]] && ! [[ $COMMAND =~ $2 ]] && return 0
   while IFS= read -r line; do
     [[ $line =~ $1 ]] && ! [[ $line =~ $2 ]] && return 0
   done <<< "$COMMAND"
