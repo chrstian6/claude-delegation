@@ -67,6 +67,18 @@ REPO_DIR = os.path.dirname(PROJECT_DIR)
 # were made built-in `[[ =~ ]]` in the same change (3796ms -> 122ms over 19
 # calls); this ceiling is the backstop for a HUNG guard, not headroom for a
 # slow one. Do not raise it again in place of fixing whatever got slow.
+#
+# THE OUTER TIMEOUT MUST EXCEED THIS, and the two are wired in different files,
+# so the arithmetic has to be stated rather than assumed. If this hook is wired
+# with a per-hook `timeout` at or below this ceiling, the host kills it while it
+# is still waiting on a guard — and a killed hook emits no JSON, which reads as
+# "defer". That is the exact flakiness this ceiling was raised to fix,
+# reintroduced from the other end.
+#
+# Worst case is the Edit family: 4 guards x 12s = 48s. So wire this hook at 60,
+# as `.claude/settings.json` does downstream. The per-guard entries in
+# hooks/hooks.json and install.sh stay at 10 — those run ONE guard each and are
+# a different budget; only this hook runs guards in series.
 GUARD_TIMEOUT_S = 12
 
 # Guard hooks re-run before approving, per tool family. Any non-zero exit
@@ -364,13 +376,29 @@ def guard_payload(payload):
 def guard_argv(path):
     """How to exec a guard. `None` means it cannot be run here — fail closed.
 
-    Every guard in GUARDS is a POSIX shell script. On POSIX the kernel reads
-    the shebang, so the bare path is the right argv. Windows has no shebang
-    handling: exec'ing the `.sh` raises OSError(8) "%1 is not a valid Win32
-    application", which lands in guards_pass's fail-closed branch — so before
-    this, the hook deferred EVERY call on Windows while looking installed.
-    Name an interpreter explicitly there.
+    On POSIX the kernel reads the shebang, so the bare path is the right argv.
+    Windows has no shebang handling: exec'ing the file raises OSError(8) "%1 is
+    not a valid Win32 application", which lands in guards_pass's fail-closed
+    branch — so before this, the hook deferred EVERY call on Windows while
+    looking installed. Name an interpreter explicitly there.
+
+    DISPATCH ON EXTENSION. GUARDS is NOT all shell scripts — an earlier version
+    of this docstring claimed it was, and the code believed it. Three entries
+    are Python: guard-frozen-tests-bash.py (Bash) and guard-delegation.py
+    (Agent, Task). Running those through bash returns 2 for EVERY payload,
+    because that is a bash parse error, not the guard's verdict. The result was
+    that on Windows the Bash, Agent and Task guards were unconditionally
+    "failing" — still fail-closed, so still safe, but inert exactly where this
+    function claimed to have fixed inertness.
+
+    The latent danger is worse than the visible one: that exit 2 is an artifact
+    of shell-parsing Python. Any future edit leaving those files bash-parseable
+    flips it to a payload-independent 0 — the guard "passes" for everything, and
+    this hook starts approving what the guard would have denied. Fail-open by
+    accident, on the Windows path nobody tests.
     """
+    if path.endswith(".py"):
+        return [sys.executable, path]         # never bash: see above
     if os.name != "nt":
         return [path]
     bash = shutil.which("bash")               # Git for Windows ships one
