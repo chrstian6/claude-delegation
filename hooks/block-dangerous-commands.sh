@@ -32,8 +32,31 @@ PROTECTED_BRANCHES="${CLAUDE_PROTECTED_BRANCHES:-$DEFAULT_BRANCHES}"
 # Build a regex alternation: main|master|develop|...
 BR_REGEX=$(printf '%s' "$PROTECTED_BRANCHES" | tr ',' '\n' | awk 'NF{printf "%s%s",sep,$0; sep="|"}')
 
-contains_cmd() { printf '%s' "$COMMAND" | grep -qE "$1"; }
-contains_icmd() { printf '%s' "$COMMAND" | grep -qiE "$1"; }
+# bash's own ERE engine, not `printf | grep` — that was two process spawns
+# per call across 19 calls, and on Windows process spawn is expensive enough
+# that this one guard measured 2.97-9.61s (15 runs, median 4.96) while the
+# other four guards are ~0.3s each. auto-approve-all.py runs every guard
+# before it may approve anything, with a per-guard timeout; at that speed it
+# was timing out on a guard that had actually PASSED, so the hook deferred
+# intermittently and .claude/tests/auto-approve-matrix.py was flaky.
+# Measured: 19 calls, 3796ms via grep -> 122ms via [[ =~ ]].
+#
+# The patterns are unchanged: [[ =~ ]] takes the same POSIX ERE, including
+# [[:space:]] classes. `$1` MUST stay unquoted on the right-hand side —
+# quoting it makes bash match it as a literal string, which would silently
+# stop every one of these checks from ever firing.
+contains_cmd() { [[ $COMMAND =~ $1 ]]; }
+# nocasematch is bash's equivalent of grep -i. Saved and restored rather than
+# left on: it is a shell-wide option and would change the behaviour of every
+# later [[ ]] and case statement in this script.
+contains_icmd() {
+  local restore rc
+  restore=$(shopt -p nocasematch)
+  shopt -s nocasematch
+  [[ $COMMAND =~ $1 ]]; rc=$?
+  eval "$restore"
+  return $rc
+}
 
 # ── Git push protections ────────────────────────────────────────────────
 if contains_cmd '(^|[;&|()]+[[:space:]]*)git[[:space:]]+push'; then
@@ -58,6 +81,19 @@ if contains_cmd '(^|[;&|()]+[[:space:]]*)git[[:space:]]+push'; then
      && ! contains_cmd '\-\-force-with-lease'; then
     emit_deny "Blocked: force push is not allowed. Use --force-with-lease if you must overwrite remote."
   fi
+fi
+
+# ── Branch / remote-ref deletion ────────────────────────────────────────
+# -D is force-delete (discards unmerged commits); -d is the safe merged-only
+# delete that CLAUDE.md's "delete branches after merge" step relies on.
+if contains_cmd 'git[[:space:]]+branch([[:space:]]+[^[:space:]]+)*[[:space:]]+(-D|--delete[[:space:]]+--force|-[a-zA-Z]*D[a-zA-Z]*)([[:space:]]|$)'; then
+  emit_deny "Blocked: 'git branch -D' force-deletes a branch with unmerged commits. Use -d, or delete manually if intended."
+fi
+if contains_cmd 'git[[:space:]]+push([[:space:]]+[^[:space:]]+)*[[:space:]]+(--delete|-d)([[:space:]]|$)'; then
+  emit_deny "Blocked: 'git push --delete' removes a remote branch. Delete it via the GitHub UI or manually if intended."
+fi
+if contains_cmd 'git[[:space:]]+push[[:space:]]+[^[:space:]]+[[:space:]]+:[^[:space:]]+'; then
+  emit_deny "Blocked: refspec ':branch' deletes a remote branch. Delete it manually if intended."
 fi
 
 # ── Destructive filesystem operations ───────────────────────────────────
