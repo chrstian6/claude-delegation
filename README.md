@@ -112,6 +112,13 @@ bin/tasks.py add "port the settings page" --level 3 --risk med
 per-project risk decision, not a default. The file is in `hooks/`; wire it yourself if you want
 it, and only behind the deny rules and guards that make it survivable.
 
+> **Wire it at `"timeout": 60`, not the `10` every other hook here uses.** This one runs the
+> other guards *in series* before it may approve anything, with its own `GUARD_TIMEOUT_S = 12`
+> per guard — worst case is the Edit family at 4 × 12 = 48s. Give it a 10s outer timeout and the
+> host kills it mid-guard; a killed hook emits no JSON, which reads as "defer", so it silently
+> stops approving anything while looking installed the whole time. The per-guard entries stay at
+> 10 because each of those runs exactly one guard.
+
 **The gate script did not come across.** `gate.sh` in the source repo is npm/vitest-shaped —
 tiered typecheck, per-slice, and merge-train checks. Porting it means writing your own tiers for
 your own toolchain; `POLICY.md`'s `test_command`, `typecheck` and `lint` keys are where they hook

@@ -50,6 +50,25 @@ BR_REGEX=$(printf '%s' "$PROTECTED_BRANCHES" | tr ',' '\n' | awk 'NF{printf "%s%
 # intermittently and .claude/tests/auto-approve-matrix.py was flaky.
 # Measured: 19 calls, 3796ms via grep -> 122ms via [[ =~ ]].
 #
+# THAT SPEEDUP IS SINGLE-LINE ONLY — do not quote it as the general case. Once
+# per-line iteration was restored below (it had to be: the whole-string form was
+# a bypass), the cost became O(lines x rules) in pure bash, and on multi-line
+# input this is now SLOWER than the grep it replaced. Best-of-3, this machine:
+#
+#   lines      grep    [[ =~ ]] whole-string    HEAD (per-line)
+#       1      50ms                     26ms              30ms
+#     200      52ms                     27ms              95ms
+#    2000      63ms                     39ms             677ms
+#   10000     177ms                    110ms            3327ms
+#
+# Crossover is ~150 lines. Heredocs writing a file and generated scripts hit
+# that easily, and Windows — where this guard already measured 2.97-9.61s and
+# where GUARD_TIMEOUT_S sits at 12 — is the platform with no headroom. Hoisting
+# the split into a one-time array recovers about a third (2000 lines:
+# 677 -> 454ms) and does not remove the linear term. Correctness first; if this
+# ever times out in practice, fix it by hoisting, never by returning to
+# whole-string matching.
+#
 # The patterns are unchanged: [[ =~ ]] takes the same POSIX ERE, including
 # [[:space:]] classes. `$1` MUST stay unquoted on the right-hand side —
 # quoting it makes bash match it as a literal string, which would silently
