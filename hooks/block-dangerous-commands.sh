@@ -45,7 +45,30 @@ BR_REGEX=$(printf '%s' "$PROTECTED_BRANCHES" | tr ',' '\n' | awk 'NF{printf "%s%
 # [[:space:]] classes. `$1` MUST stay unquoted on the right-hand side —
 # quoting it makes bash match it as a literal string, which would silently
 # stop every one of these checks from ever firing.
-contains_cmd() { [[ $COMMAND =~ $1 ]]; }
+#
+# ITERATE PER LINE. Not a style choice — removing the loop reopens a proven
+# bypass. `grep -qE` matches per LINE, so `^` and `$` anchor at every newline.
+# `[[ =~ ]]` matches the WHOLE STRING, so `^` anchors only at the very start.
+# The regexes are byte-identical and the semantics are not, which is why "the
+# patterns are unchanged" above was true and irrelevant. Every rule anchored
+# with `(^|[;&|()]+...)` or a trailing `$` silently stopped applying to any
+# line after the first:
+#
+#   git push --force origin main            -> denied  (one line, ^ matches)
+#   cd /repo <newline> git push --force ...  -> ALLOWED before this fix
+#
+# Caught in review, then reproduced end to end: a two-line Bash call
+# force-pushing to main was auto-approved with no prompt shown. Only the push
+# family diverged (4 of 80 probed variants) because `\n` falls inside
+# [[:space:]] for every other rule — which is exactly what made it invisible.
+_match_lines() {                  # _match_lines <ere>; reads $COMMAND
+  local line
+  while IFS= read -r line; do
+    [[ $line =~ $1 ]] && return 0
+  done <<< "$COMMAND"
+  return 1
+}
+contains_cmd() { _match_lines "$1"; }
 # nocasematch is bash's equivalent of grep -i. Saved and restored rather than
 # left on: it is a shell-wide option and would change the behaviour of every
 # later [[ ]] and case statement in this script.
@@ -53,7 +76,7 @@ contains_icmd() {
   local restore rc
   restore=$(shopt -p nocasematch)
   shopt -s nocasematch
-  [[ $COMMAND =~ $1 ]]; rc=$?
+  _match_lines "$1"; rc=$?
   eval "$restore"
   return $rc
 }
