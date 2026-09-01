@@ -88,6 +88,37 @@ def main() -> None:
         sys.exit(0)
 
     subagent = tool_input.get("subagent_type")
+
+    # NAME A ROLE. Every check below inspects subagent_type only when it is a
+    # non-empty string, so a missing, null or blank one sailed past all of them
+    # and this guard exited 0 — approving a dispatch whose role nothing could
+    # see. The engine resolves an absent subagent_type to a catch-all carrying
+    # every tool including Agent, which is the precise thing CATCH_ALL below
+    # exists to refuse; omitting the field was a way to ask for it that this
+    # guard did not read as asking.
+    #
+    # Downstream this was worse than it looks. auto-approve-all.py's fail-closed
+    # only covers a tool a deny rule actually names: with `Agent(general-purpose)`
+    # in permissions.deny and no `Task(...)` rule, `Agent` with no role deferred
+    # while `Task` with no role was AUTO-APPROVED. Fixing it here rather than
+    # there closes both, and closes it for the engine's own path too — the guard
+    # is the boundary, not the approval hook.
+    if subagent is None or not isinstance(subagent, str) or not subagent.strip():
+        block(
+            "BLOCKED: this dispatch names no subagent_type.\n\n"
+            "An absent role resolves to a catch-all carrying every tool,\n"
+            "including Agent itself — no role boundary at all, and no contract\n"
+            "limits anything the engine will enforce.\n\n"
+            "Name the tier whose toolset already denies what your contract\n"
+            "forbids:\n\n"
+            "  researcher  gathers evidence; runs nothing\n"
+            "  architect   designs and diagnoses; writes no source\n"
+            "  builder     the only role that writes source\n"
+            "  tester      runs checks; cannot edit\n"
+            "  reviewer    cannot write, so creator != reviewer\n"
+            "  repairer    minimal corrective change"
+        )
+
     if isinstance(subagent, str) and norm(subagent) in CATCH_ALL:
         block(
             f"BLOCKED: '{subagent}' is a catch-all subagent type.\n\n"

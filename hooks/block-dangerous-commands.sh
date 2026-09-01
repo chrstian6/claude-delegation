@@ -23,6 +23,32 @@ INPUT=$(cat)
 COMMAND=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null || true)
 [ -z "$COMMAND" ] && exit 0
 
+# NORMALISE CONTINUATIONS BEFORE ANY MATCHING. `git push \<newline> --force
+# origin main` is one logical command written across two physical lines, and the
+# shell runs it as one. Matching the raw physical lines lets an ordinary
+# line-wrapped invocation slip past every rule.
+#
+# DROP THE BACKSLASH, KEEP THE NEWLINE. Joining to a SPACE instead was a net
+# REGRESSION and was caught in review after being shipped: it splices the two
+# lines into one, and every push rule is anchored `(^[[:space:]]*|[;&|()]+...)`,
+# so anything spliced in front of `git push` closes the gate that was open
+# before. Measured, joining-to-space vs the version before it:
+#
+#   time \<newline>git push --force origin old      DENY -> allow
+#   sudo \<newline>git push --force origin main     DENY -> allow
+#   FOO=bar \<newline>git push --force origin old   DENY -> allow
+#   echo a\\<newline>git push --force origin old    DENY -> allow
+#
+# Four shapes lost to buy one. The last is the sharpest: `\\` is an ESCAPED
+# BACKSLASH, not a continuation — the shell runs two separate commands, and
+# joining them hid a real force push behind `echo a\ `. Joining to a newline
+# cannot splice two commands onto one line, so no anchored pattern is defeated.
+#
+# CR first, or `\`+CRLF is not recognised as a continuation at all and the
+# command stays split.
+COMMAND=${COMMAND//$'\r'/}
+COMMAND=${COMMAND//\\$'\n'/$'\n'}
+
 # ── Protected branch list ────────────────────────────────────────────────
 DEFAULT_BRANCHES="main,master"
 if GIT_DEFAULT=$(git config --get init.defaultBranch 2>/dev/null) && [ -n "$GIT_DEFAULT" ]; then
@@ -32,11 +58,107 @@ PROTECTED_BRANCHES="${CLAUDE_PROTECTED_BRANCHES:-$DEFAULT_BRANCHES}"
 # Build a regex alternation: main|master|develop|...
 BR_REGEX=$(printf '%s' "$PROTECTED_BRANCHES" | tr ',' '\n' | awk 'NF{printf "%s%s",sep,$0; sep="|"}')
 
-contains_cmd() { printf '%s' "$COMMAND" | grep -qE "$1"; }
-contains_icmd() { printf '%s' "$COMMAND" | grep -qiE "$1"; }
+# bash's own ERE engine, not `printf | grep` — that was two process spawns
+# per call across 19 calls, and on Windows process spawn is expensive enough
+# that this one guard measured 2.97-9.61s (15 runs, median 4.96) while the
+# other four guards are ~0.3s each. auto-approve-all.py runs every guard
+# before it may approve anything, with a per-guard timeout; at that speed it
+# was timing out on a guard that had actually PASSED, so the hook deferred
+# intermittently and .claude/tests/auto-approve-matrix.py was flaky.
+# Measured: 19 calls, 3796ms via grep -> 122ms via [[ =~ ]].
+#
+# THAT SPEEDUP IS SINGLE-LINE ONLY — do not quote it as the general case. Once
+# per-line iteration was restored below (it had to be: the whole-string form was
+# a bypass), the cost became O(lines x rules) in pure bash, and on multi-line
+# input this is now SLOWER than the grep it replaced. Best-of-3, this machine:
+#
+#   lines      grep    [[ =~ ]] whole-string    HEAD (per-line)
+#       1      50ms                     26ms              30ms
+#     200      52ms                     27ms              95ms
+#    2000      63ms                     39ms             677ms
+#   10000     177ms                    110ms            3327ms
+#
+# Crossover is ~150 lines. Heredocs writing a file and generated scripts hit
+# that easily, and Windows — where this guard already measured 2.97-9.61s and
+# where GUARD_TIMEOUT_S sits at 12 — is the platform with no headroom. Hoisting
+# the split into a one-time array recovers about a third (2000 lines:
+# 677 -> 454ms) and does not remove the linear term. Correctness first; if this
+# ever times out in practice, fix it by hoisting, never by returning to
+# whole-string matching.
+#
+# The patterns are unchanged: [[ =~ ]] takes the same POSIX ERE, including
+# [[:space:]] classes. `$1` MUST stay unquoted on the right-hand side —
+# quoting it makes bash match it as a literal string, which would silently
+# stop every one of these checks from ever firing.
+#
+# ITERATE PER LINE. Not a style choice — removing the loop reopens a proven
+# bypass. `grep -qE` matches per LINE, so `^` and `$` anchor at every newline.
+# `[[ =~ ]]` matches the WHOLE STRING, so `^` anchors only at the very start.
+# The regexes are byte-identical and the semantics are not, which is why "the
+# patterns are unchanged" above was true and irrelevant. Every rule anchored
+# with `(^|[;&|()]+...)` or a trailing `$` silently stopped applying to any
+# line after the first:
+#
+#   git push --force origin main            -> denied  (one line, ^ matches)
+#   cd /repo <newline> git push --force ...  -> ALLOWED before this fix
+#
+# Caught in review, then reproduced end to end: a two-line Bash call
+# force-pushing to main was auto-approved with no prompt shown. Only the push
+# family diverged (4 of 80 probed variants) because `\n` falls inside
+# [[:space:]] for every other rule — which is exactly what made it invisible.
+#
+# WHOLE-STRING FIRST, THEN PER LINE. The whole-string pass is not redundant: a
+# backslash line-continuation splits one logical command across two physical
+# lines, so `git push \<newline>  --force origin main` is invisible to every
+# per-line pattern while the whole-string pass still sees it. Per-line alone
+# would have been a straight downgrade from the discarded version on exactly
+# that shape.
+_match_lines() {                  # _match_lines <ere>; reads $COMMAND
+  local line
+  [[ $COMMAND =~ $1 ]] && return 0
+  while IFS= read -r line; do
+    [[ $line =~ $1 ]] && return 0
+  done <<< "$COMMAND"
+  return 1
+}
+contains_cmd() { _match_lines "$1"; }
+# A deny pattern with a suppressor must see BOTH on the same line. Riding two
+# separate whole-input calls let a suppressor on one line disarm a deny on
+# another: `npm publish --dry-run` followed by a real `npm publish` was allowed,
+# which is the precise thing that rule exists to stop.
+contains_cmd_unless() {           # contains_cmd_unless <ere> <suppressor-ere>
+  local line
+  # Whole-string pass first, same as contains_cmd. Without it this helper is the
+  # ONLY matcher with no cross-line fallback — and it is the one the force-push
+  # rule uses, so any shape the per-line loop cannot see (a continuation the
+  # normaliser above missed) has no second chance. The suppressor is checked at
+  # the same scope, so a legitimate whole-command `--force-with-lease` still
+  # suppresses; a lease on a DIFFERENT line does not, because the per-line loop
+  # below is what decides that case.
+  [[ $COMMAND =~ $1 ]] && ! [[ $COMMAND =~ $2 ]] && return 0
+  while IFS= read -r line; do
+    [[ $line =~ $1 ]] && ! [[ $line =~ $2 ]] && return 0
+  done <<< "$COMMAND"
+  return 1
+}
+# nocasematch is bash's equivalent of grep -i. Saved and restored rather than
+# left on: it is a shell-wide option and would change the behaviour of every
+# later [[ ]] and case statement in this script.
+contains_icmd() {
+  local restore rc
+  restore=$(shopt -p nocasematch)
+  shopt -s nocasematch
+  _match_lines "$1"; rc=$?
+  eval "$restore"
+  return $rc
+}
 
 # ── Git push protections ────────────────────────────────────────────────
-if contains_cmd '(^|[;&|()]+[[:space:]]*)git[[:space:]]+push'; then
+# `^[[:space:]]*` — WITHOUT it a single leading space or tab disables every push
+# rule below, because they all live inside this gate and the alternation had no
+# whitespace-after-^ branch. An indented `git push --force origin main`, which is
+# what any command inside an `if`/`for`/heredoc looks like, sailed through.
+if contains_cmd '(^[[:space:]]*|[;&|()]+[[:space:]]*)git[[:space:]]+push'; then
   # Explicit refspec to a protected branch (origin main, :main, HEAD:main, remote branch)
   if contains_cmd "git[[:space:]]+push[[:space:]]+[^[:space:]]+[[:space:]]+([^[:space:]]*:)?($BR_REGEX)(\$|[[:space:]])"; then
     MATCHED_BRANCH=$(printf '%s' "$COMMAND" | grep -oE "($BR_REGEX)(\$|[[:space:]])" | head -1 | tr -d '[:space:]')
@@ -54,10 +176,25 @@ if contains_cmd '(^|[;&|()]+[[:space:]]*)git[[:space:]]+push'; then
     fi
   fi
   # Force push (but allow --force-with-lease)
-  if contains_cmd 'git[[:space:]]+push([[:space:]]+[^[:space:]]+)*[[:space:]]+(-[a-zA-Z]*f[a-zA-Z]*|--force)([[:space:]=]|$)' \
-     && ! contains_cmd '\-\-force-with-lease'; then
+  # Same-line suppressor: a --force-with-lease on ANOTHER line must not disarm a
+  # real --force on this one.
+  if contains_cmd_unless 'git[[:space:]]+push([[:space:]]+[^[:space:]]+)*[[:space:]]+(-[a-zA-Z]*f[a-zA-Z]*|--force)([[:space:]=]|$)' \
+     '\-\-force-with-lease'; then
     emit_deny "Blocked: force push is not allowed. Use --force-with-lease if you must overwrite remote."
   fi
+fi
+
+# ── Branch / remote-ref deletion ────────────────────────────────────────
+# -D is force-delete (discards unmerged commits); -d is the safe merged-only
+# delete that CLAUDE.md's "delete branches after merge" step relies on.
+if contains_cmd 'git[[:space:]]+branch([[:space:]]+[^[:space:]]+)*[[:space:]]+(-D|--delete[[:space:]]+--force|-[a-zA-Z]*D[a-zA-Z]*)([[:space:]]|$)'; then
+  emit_deny "Blocked: 'git branch -D' force-deletes a branch with unmerged commits. Use -d, or delete manually if intended."
+fi
+if contains_cmd 'git[[:space:]]+push([[:space:]]+[^[:space:]]+)*[[:space:]]+(--delete|-d)([[:space:]]|$)'; then
+  emit_deny "Blocked: 'git push --delete' removes a remote branch. Delete it via the GitHub UI or manually if intended."
+fi
+if contains_cmd 'git[[:space:]]+push[[:space:]]+[^[:space:]]+[[:space:]]+:[^[:space:]]+'; then
+  emit_deny "Blocked: refspec ':branch' deletes a remote branch. Delete it manually if intended."
 fi
 
 # ── Destructive filesystem operations ───────────────────────────────────
@@ -132,7 +269,7 @@ publish_patterns=(
   'twine[[:space:]]+upload'
 )
 for pat in "${publish_patterns[@]}"; do
-  if contains_cmd "$pat" && ! contains_cmd '(^|[[:space:]])(--dry-run|-n)([[:space:]=]|$)'; then
+  if contains_cmd_unless "$pat" '(^|[[:space:]])(--dry-run|-n)([[:space:]=]|$)'; then
     emit_deny "Blocked: publishing packages should run in CI or manually, not via Claude."
   fi
 done

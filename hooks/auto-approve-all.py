@@ -44,6 +44,7 @@ import fnmatch
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import unicodedata
@@ -56,16 +57,47 @@ REPO_DIR = os.path.dirname(PROJECT_DIR)
 # a hung guard still leaves budget to exit quietly rather than being killed
 # mid-write (a killed hook emits no JSON, which reads as "defer" — safe, but
 # deferring deliberately is better than deferring by execution).
-GUARD_TIMEOUT_S = 6
+# Raised 6 -> 12. block-dangerous-commands.sh was the only slow guard, at
+# 2.97-9.61s per call on Windows (15 runs, median 4.96, p90 7.48) against the
+# other guards at ~0.3s each — process-spawn cost, not bash startup. At 6s that
+# timed out 4 times in 15 ON AN IDLE MACHINE, so this hook was deferring on a
+# guard that had actually PASSED.
+# 12s alone was NOT enough: the matrix test still failed its two benign-Bash
+# cases under its own sustained load. The guard's own `printf | grep` helpers
+# were made built-in `[[ =~ ]]` in the same change (3796ms -> 122ms over 19
+# calls); this ceiling is the backstop for a HUNG guard, not headroom for a
+# slow one. Do not raise it again in place of fixing whatever got slow.
+#
+# THE OUTER TIMEOUT MUST EXCEED THIS, and the two are wired in different files,
+# so the arithmetic has to be stated rather than assumed. If this hook is wired
+# with a per-hook `timeout` at or below this ceiling, the host kills it while it
+# is still waiting on a guard — and a killed hook emits no JSON, which reads as
+# "defer". That is the exact flakiness this ceiling was raised to fix,
+# reintroduced from the other end.
+#
+# Worst case is the Edit family: 4 guards x 12s = 48s. So wire this hook at 60,
+# as `.claude/settings.json` does downstream. The per-guard entries in
+# hooks/hooks.json and install.sh stay at 10 — those run ONE guard each and are
+# a different budget; only this hook runs guards in series.
+GUARD_TIMEOUT_S = 12
 
 # Guard hooks re-run before approving, per tool family. Any non-zero exit
 # (deny OR ask) means this hook stays silent and the normal flow decides.
-# guard-frozen-tests.sh lives in scripts/, not hooks/ — it ships with Agent OS.
-# Without it here, this hook would answer `allow` for an edit to a frozen test
-# while the wired guard blocks it: still blocked (deny is monotonic), but this
-# file's contract is that what it approves is a subset of what the engine allows.
+# guard-frozen-tests.sh ships alongside the other guards in this plugin's
+# hooks/ directory. Without it here, this hook would answer `allow` for an edit
+# to a frozen test while the wired guard blocks it: still blocked (deny is
+# monotonic), but this file's contract is that what it approves is a subset of
+# what the engine allows.
+#
+# The name is resolved against HERE, so it is a BARE name, not a path. It read
+# `../.guard-frozen-tests.sh` when this was genericized from the source project
+# (whose copy lived in scripts/): the path was string-edited instead of being
+# recomputed for the plugin's layout, and resolved to a file that does not
+# exist. guards_pass fails CLOSED on a missing guard, so that one wrong name
+# made this hook defer every single Edit/Write/MultiEdit/NotebookEdit — the
+# whole point of the file, silently inert, with nothing failing.
 EDIT_GUARDS = ("protect-files.sh", "warn-large-files.sh", "scan-secrets.sh",
-               "../.guard-frozen-tests.sh")
+               "guard-frozen-tests.sh")
 GUARDS = {
     "Bash": ("guard-frozen-tests-bash.py", "block-dangerous-commands.sh",
              "orchestrator-only-git.sh"),
@@ -165,6 +197,11 @@ def glob_to_regex(pat):
     return re.compile("^" + out + "$")
 
 
+def to_posix(path):
+    """Native separators -> `/`. No-op where os.sep already is `/`."""
+    return path.replace(os.sep, "/") if os.sep != "/" else path
+
+
 def glob_matches(pattern, value):
     """Match a rule glob against the absolute and repo-relative forms of a path."""
     value = os.path.normpath(value)
@@ -174,6 +211,15 @@ def glob_matches(pattern, value):
             candidates.add(value[len(REPO_DIR) + 1:])
     else:
         candidates.add(os.path.normpath(os.path.join(REPO_DIR, value)))
+
+    # Compare in POSIX form. glob_to_regex is `/`-based by construction, but
+    # os.path.normpath emits `\` on Windows, and the two then disagree in BOTH
+    # directions: `(?:.*/)?` never matches a nested `a\b\.env.local`, so a deny
+    # rule silently stops applying (the unsafe direction), while `[^/]*` happily
+    # crosses `a\b.pem` because a backslash is not a slash (merely imprecise).
+    # fnmatch rescues neither: its `*` crosses separators, but `**/` still needs
+    # a literal `/` that a backslashed candidate does not have.
+    candidates = {to_posix(c) for c in candidates}
 
     # A bare `secrets/**` should also match nested occurrences.
     patterns = {pattern}
@@ -267,7 +313,20 @@ def rule_blocks(rule, tool, tool_input):
             return True                       # can't see the target: fail closed
         return any(glob_matches(spec, v) for v in values)
 
-    if tool == "Agent":
+    if tool in ("Agent", "Task"):
+        # BOTH names, not just Agent. GUARDS wires guard-delegation.py for Agent
+        # AND Task, and hooks.json matches them together as "Task|Agent" — the
+        # two are meant to be the same tool. This branch was gated on Agent
+        # alone, so a Task dispatch with a missing or null subagent_type never
+        # reached the fail-closed return below and was AUTO-APPROVED, while the
+        # identical Agent payload deferred. guard-delegation.py does not cover
+        # it either: it inspects subagent_type only when it is a non-empty
+        # string, so a missing one passes every check it makes.
+        #
+        # Reproduced before the fix:
+        #   Agent, no subagent_type -> defer
+        #   Task,  no subagent_type -> ALLOW
+        #
         # An `Agent(<name>)` deny rule names a subagent type, not a path or a
         # command, so it needs its own comparison. The role allowlist hook was
         # retired on 2026-08-30 with the named-agent org — under Agent OS the
@@ -327,14 +386,49 @@ def guard_payload(payload):
     return out
 
 
+def guard_argv(path):
+    """How to exec a guard. `None` means it cannot be run here — fail closed.
+
+    On POSIX the kernel reads the shebang, so the bare path is the right argv.
+    Windows has no shebang handling: exec'ing the file raises OSError(8) "%1 is
+    not a valid Win32 application", which lands in guards_pass's fail-closed
+    branch — so before this, the hook deferred EVERY call on Windows while
+    looking installed. Name an interpreter explicitly there.
+
+    DISPATCH ON EXTENSION. GUARDS is NOT all shell scripts — an earlier version
+    of this docstring claimed it was, and the code believed it. Three entries
+    are Python: guard-frozen-tests-bash.py (Bash) and guard-delegation.py
+    (Agent, Task). Running those through bash returns 2 for EVERY payload,
+    because that is a bash parse error, not the guard's verdict. The result was
+    that on Windows the Bash, Agent and Task guards were unconditionally
+    "failing" — still fail-closed, so still safe, but inert exactly where this
+    function claimed to have fixed inertness.
+
+    The latent danger is worse than the visible one: that exit 2 is an artifact
+    of shell-parsing Python. Any future edit leaving those files bash-parseable
+    flips it to a payload-independent 0 — the guard "passes" for everything, and
+    this hook starts approving what the guard would have denied. Fail-open by
+    accident, on the Windows path nobody tests.
+    """
+    if path.endswith(".py"):
+        return [sys.executable, path]         # never bash: see above
+    if os.name != "nt":
+        return [path]
+    bash = shutil.which("bash")               # Git for Windows ships one
+    return [bash, path] if bash else None
+
+
 def guards_pass(tool, payload):
     raw = json.dumps(guard_payload(payload)).encode()
     for guard in GUARDS.get(tool, ()):
         path = os.path.join(HERE, guard)
         if not (os.path.isfile(path) and os.access(path, os.X_OK)):
             return False                      # missing or unrunnable: fail closed
+        argv = guard_argv(path)
+        if argv is None:
+            return False                      # no shell to run it with: fail closed
         try:
-            done = subprocess.run(path, input=raw, capture_output=True,
+            done = subprocess.run(argv, input=raw, capture_output=True,
                                   timeout=GUARD_TIMEOUT_S, cwd=REPO_DIR)
         except Exception:
             return False                      # guard unusable: fail closed
