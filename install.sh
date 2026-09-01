@@ -23,13 +23,30 @@ TARGET="$(cd "$TARGET" && pwd)"
 C="$TARGET/.claude"
 mkdir -p "$C"/{agents,hooks,skills,state}
 
-place() {                        # place <src-dir> <dst-dir>
+# place <src-dir> <dst-dir>
+#
+# Copies the package's entries INTO dst, overwriting same-named ones and leaving
+# everything else alone. It deliberately does NOT `rm -rf "$dst"` first.
+#
+# It used to. `place "$PKG/skills" "$C/skills"` then deleted every skill the
+# project had authored — on one real target that was 15 skills, including the
+# two that carried its database stack, none of which this package ships. The
+# README described this step as "copies agents, skills, bin and hooks" and never
+# mentioned a delete, and `bin/skills.py` is documented as merging "the
+# project's own .claude/skills/ on top" — which the copy route then made
+# impossible. An installer silently deleting the user's own work is the worst
+# failure this package can have, so the destructive form is gone rather than
+# guarded.
+#
+# Stale plugin-owned entries are not pruned. That is the deliberate trade: an
+# orphan costs nothing, a deleted project skill is unrecoverable if uncommitted.
+place() {
   local src="$1" dst="$2"
   if [[ "$MODE" == "link" ]]; then
     ln -sfn "$src" "$dst"
   else
-    rm -rf "$dst"
-    cp -R "$src" "$dst"
+    mkdir -p "$dst"
+    cp -R "$src"/. "$dst"/
   fi
 }
 
